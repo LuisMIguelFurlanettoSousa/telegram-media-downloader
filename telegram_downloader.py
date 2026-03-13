@@ -409,7 +409,14 @@ async def main():
         flood_sleep_threshold=120,
         timeout=30,
     )
-    await client.start()
+    try:
+        await client.start()
+    except errors.PhoneNumberInvalidError:
+        print("\n❌ Número de telefone inválido. Verifique o formato (ex: +5511999999999) e tente novamente.")
+        return
+    except errors.ApiIdInvalidError:
+        print("\n❌ API ID ou API Hash inválidos. Verifique suas credenciais no arquivo .env.")
+        return
 
     print(f"\n{'='*50}")
     print("  TELEGRAM GROUP DOWNLOADER")
