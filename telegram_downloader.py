@@ -290,9 +290,11 @@ async def get_group_media_stats(client: TelegramClient, group, media_types: list
     return {"total_size": total_size, "counts": counts}
 
 
-async def download_media_from_group(client: TelegramClient, group, media_types: list[str], limit: int | None):
+async def download_media_from_group(client: TelegramClient, group, media_types: list[str], limit: int | None, base_dir: Path | None = None):
     group_name = group.name.replace("/", "_").replace("\\", "_").strip()
-    download_dir = Path.cwd() / "downloads" / group_name
+    if base_dir is None:
+        base_dir = Path.cwd() / "downloads"
+    download_dir = base_dir / group_name
     download_dir.mkdir(parents=True, exist_ok=True)
 
     stats = await get_group_media_stats(client, group, media_types, limit)
@@ -488,8 +490,32 @@ async def main():
         if limit and not limit_input.isdigit():
             print(f"  (valor inválido, usando padrão: {limit})")
 
+        print(f"\nOnde deseja salvar os arquivos?")
+        print(f"  - Digite o caminho completo da pasta (ex: /home/usuario/cursos)")
+        print(f"  - Ou pressione ENTER para usar o padrão (./downloads)\n")
+
         try:
-            await download_media_from_group(client, selected, media_types, limit)
+            dir_input = input("👉 Pasta de destino: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\nSaindo...")
+            break
+
+        base_dir = None
+        if dir_input:
+            base_dir = Path(dir_input).expanduser().resolve()
+            if not base_dir.exists():
+                try:
+                    criar = input(f"  📁 A pasta '{base_dir}' não existe. Deseja criá-la? (s/n): ").strip().lower()
+                except (KeyboardInterrupt, EOFError):
+                    print("\nSaindo...")
+                    break
+                if criar != "s":
+                    print("⏭  Download cancelado.\n")
+                    continue
+            print(f"  📂 Arquivos serão salvos em: {base_dir / selected.name.replace('/', '_').replace(chr(92), '_').strip()}\n")
+
+        try:
+            await download_media_from_group(client, selected, media_types, limit, base_dir)
         except (ConnectionError, TimeoutError, OSError) as e:
             logger.error("Conexão perdida durante download: %s", e)
             print(f"\n🔌 Conexão perdida: {e}")
