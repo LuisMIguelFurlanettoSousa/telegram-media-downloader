@@ -4,6 +4,8 @@ Telegram Group Downloader
 Baixa vídeos e arquivos de grupos do Telegram via API (MTProto).
 """
 
+import os
+import re
 import sys
 import asyncio
 import json
@@ -18,6 +20,9 @@ from telethon.tl.types import (
     Chat,
     DocumentAttributeFilename,
     DocumentAttributeVideo,
+    InputMessagesFilterDocument,
+    InputMessagesFilterPhotos,
+    InputMessagesFilterVideo,
     MessageMediaDocument,
     MessageMediaPhoto,
 )
@@ -100,12 +105,26 @@ def format_size(size_bytes: int) -> str:
     return f"{size_bytes:.1f} TB"
 
 
+def sanitize_filename(name: str) -> str:
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name)
+    name = name.strip('. ')
+    return name[:255]
+
+
+def check_cryptg():
+    try:
+        import cryptg
+        return True
+    except ImportError:
+        return False
+
+
 def get_file_name(message) -> str | None:
     if not message.media:
         return None
 
     if isinstance(message.media, MessageMediaPhoto):
-        return f"foto_{message.id}.jpg"
+        return sanitize_filename(f"foto_{message.id}.jpg")
 
     if isinstance(message.media, MessageMediaDocument):
         doc = message.media.document
@@ -114,7 +133,9 @@ def get_file_name(message) -> str | None:
 
         for attr in doc.attributes:
             if isinstance(attr, DocumentAttributeFilename):
-                return attr.file_name
+                stem = Path(attr.file_name).stem
+                suffix = Path(attr.file_name).suffix
+                return sanitize_filename(f"{stem}_msg{message.id}{suffix}")
 
         for attr in doc.attributes:
             if isinstance(attr, DocumentAttributeVideo):
@@ -124,11 +145,11 @@ def get_file_name(message) -> str | None:
                     ext = "webm"
                 elif "mkv" in mime:
                     ext = "mkv"
-                return f"video_{message.id}.{ext}"
+                return sanitize_filename(f"video_{message.id}.{ext}")
 
         mime = getattr(doc, "mime_type", "")
         ext = mime.split("/")[-1] if "/" in mime else "bin"
-        return f"arquivo_{message.id}.{ext}"
+        return sanitize_filename(f"arquivo_{message.id}.{ext}")
 
     return None
 
@@ -159,6 +180,8 @@ class DownloadProgress:
         self.start_time = time.time()
 
     def callback(self, current, total):
+        if total <= 0:
+            return
         elapsed = time.time() - self.start_time
         speed = current / elapsed if elapsed > 0.5 else 0
         remaining = (total - current) / speed if speed > 0 else 0
@@ -181,16 +204,36 @@ class DownloadProgress:
 def load_download_log() -> dict:
     if LOG_FILE.exists():
         try:
-            return json.loads(LOG_FILE.read_text())
+            log = json.loads(LOG_FILE.read_text())
         except (json.JSONDecodeError, OSError):
             return {}
+
+        # Migração do formato antigo para o novo (message_id como chave)
+        for key, value in log.items():
+            if isinstance(value, dict) and "downloaded" not in value:
+                old_failed = value.get("failed_files", [])
+                new_failed = {}
+                for fname in old_failed:
+                    new_failed[fname] = {"file": fname, "error": "migrado do formato antigo"}
+                log[key] = {
+                    "downloaded": {},
+                    "failed": new_failed,
+                    "stats": {
+                        "completed": value.get("completed", 0),
+                        "errors": value.get("errors", len(old_failed)),
+                    },
+                }
+
+        return log
     return {}
 
 
 def save_download_log(log: dict):
     try:
-        LOG_FILE.write_text(json.dumps(log, indent=2, ensure_ascii=False))
-    except OSError as e:
+        tmp = LOG_FILE.with_suffix('.json.tmp')
+        tmp.write_text(json.dumps(log, indent=2, ensure_ascii=False))
+        os.replace(str(tmp), str(LOG_FILE))
+    except Exception as e:
         logger.warning("Falha ao salvar log de download: %s", e)
 
 
@@ -205,17 +248,61 @@ def check_disk_space(path: Path, required_bytes: int) -> bool:
     return True
 
 
-async def download_with_retry(client: TelegramClient, message, file_path: Path, expected_size: int | None, show_progress: bool = True) -> bool:
-    for attempt in range(1, MAX_RETRIES + 1):
+async def download_with_retry(client: TelegramClient, entity, message_id: int, file_path: Path, expected_size: int | None, show_progress: bool = True) -> bool:
+    attempt = 1
+    while attempt <= MAX_RETRIES:
         try:
+            fresh_message = await client.get_messages(entity, ids=message_id)
+            if fresh_message is None:
+                logger.warning("Mensagem %d não encontrada ao re-buscar", message_id)
+                print(f"\n  ⚠  Mensagem {message_id} não encontrada no grupo")
+                return False
+
             progress = DownloadProgress() if show_progress else None
-            await client.download_media(
-                message,
+            result = await client.download_media(
+                fresh_message,
                 file=str(file_path),
                 progress_callback=progress.callback if progress else None,
             )
             if show_progress:
                 print()
+
+            if result is None:
+                if file_path.exists():
+                    file_path.unlink()
+                logger.warning("download_media retornou None: %s (tentativa %d/%d)", file_path.name, attempt, MAX_RETRIES)
+                if attempt < MAX_RETRIES:
+                    delay = min(INITIAL_RETRY_DELAY * (2 ** (attempt - 1)), MAX_RETRY_DELAY)
+                    print(f"\n  ⚠  Download silencioso falhou: {file_path.name}")
+                    print(f"     Tentativa {attempt}/{MAX_RETRIES} — retentando em {delay}s...")
+                    await asyncio.sleep(delay)
+                attempt += 1
+                continue
+
+            result_path = Path(result)
+            if not result_path.exists():
+                logger.warning("Arquivo não encontrado após download: %s (tentativa %d/%d)", result_path.name, attempt, MAX_RETRIES)
+                if attempt < MAX_RETRIES:
+                    delay = min(INITIAL_RETRY_DELAY * (2 ** (attempt - 1)), MAX_RETRY_DELAY)
+                    print(f"\n  ⚠  Arquivo não encontrado: {file_path.name}")
+                    print(f"     Tentativa {attempt}/{MAX_RETRIES} — retentando em {delay}s...")
+                    await asyncio.sleep(delay)
+                attempt += 1
+                continue
+
+            if result_path != file_path:
+                result_path.rename(file_path)
+
+            if file_path.stat().st_size == 0:
+                logger.warning("Arquivo vazio após download: %s", file_path.name)
+                file_path.unlink()
+                if attempt < MAX_RETRIES:
+                    delay = min(INITIAL_RETRY_DELAY * (2 ** (attempt - 1)), MAX_RETRY_DELAY)
+                    print(f"\n  ⚠  Arquivo vazio: {file_path.name}")
+                    print(f"     Tentativa {attempt}/{MAX_RETRIES} — retentando em {delay}s...")
+                    await asyncio.sleep(delay)
+                attempt += 1
+                continue
 
             return True
 
@@ -228,10 +315,11 @@ async def download_with_retry(client: TelegramClient, message, file_path: Path, 
         except errors.FloodWaitError as e:
             wait_time = e.seconds + 5
             print(f"\n  ⏳ Flood wait do Telegram: aguardando {wait_time}s antes de retentar...")
-            logger.warning("FloodWaitError: aguardando %ds (tentativa %d/%d)", wait_time, attempt, MAX_RETRIES)
+            logger.warning("FloodWaitError: aguardando %ds", wait_time)
             if file_path.exists():
                 file_path.unlink()
             await asyncio.sleep(wait_time)
+            # FloodWait NÃO consome tentativa
 
         except (ConnectionError, TimeoutError, OSError) as e:
             delay = min(INITIAL_RETRY_DELAY * (2 ** (attempt - 1)), MAX_RETRY_DELAY)
@@ -241,6 +329,7 @@ async def download_with_retry(client: TelegramClient, message, file_path: Path, 
             if file_path.exists():
                 file_path.unlink()
             await asyncio.sleep(delay)
+            attempt += 1
 
         except Exception as e:
             delay = min(INITIAL_RETRY_DELAY * (2 ** (attempt - 1)), MAX_RETRY_DELAY)
@@ -250,6 +339,7 @@ async def download_with_retry(client: TelegramClient, message, file_path: Path, 
             if file_path.exists():
                 file_path.unlink()
             await asyncio.sleep(delay)
+            attempt += 1
 
     logger.error("Falha permanente após %d tentativas: %s", MAX_RETRIES, file_path.name)
     return False
@@ -264,24 +354,75 @@ async def list_groups(client: TelegramClient) -> list:
     return groups
 
 
-async def get_group_media_stats(client: TelegramClient, group, media_types: list[str], limit: int | None) -> dict:
+TELETHON_FILTERS = {
+    "video": InputMessagesFilterVideo,
+    "photo": InputMessagesFilterPhotos,
+    "document": InputMessagesFilterDocument,
+}
+
+
+async def scan_group_media(client: TelegramClient, group, media_types: list[str], limit: int | None, download_dir: Path, download_log: dict, group_log_key: str):
+    """Escaneia mensagens UMA vez, retornando stats e lista de pendentes."""
     total_size = 0
     counts = {"video": 0, "photo": 0, "document": 0}
+    pending = []
+    skipped = 0
 
-    print(f"📊 Calculando tamanho do grupo '{group.name}'...", end="", flush=True)
+    print(f"📊 Escaneando grupo '{group.name}'...", end="", flush=True)
 
-    for attempt in range(1, MAX_RETRIES + 1):
+    telethon_filter = None
+    if len(media_types) == 1:
+        telethon_filter = TELETHON_FILTERS.get(media_types[0])
+
+    # Contagem instantânea quando há filtro server-side
+    if telethon_filter:
+        quick_count = await client.get_messages(group.entity, 0, filter=telethon_filter())
+        if quick_count.total == 0:
+            print(f" 0 {media_types[0]}s encontrados.\n")
+            return {"total_size": 0, "counts": counts}, [], 0
+        print(f" ~{quick_count.total} encontrados...", end="", flush=True)
+
+    success = False
+    for attempt_num in range(1, MAX_RETRIES + 1):
         try:
-            async for message in client.iter_messages(group.entity, limit=limit, reverse=True):
+            async for message in client.iter_messages(
+                group.entity, limit=limit, reverse=True,
+                filter=telethon_filter
+            ):
                 media_type = classify_media(message)
                 if media_type is None or media_type not in media_types:
                     continue
 
                 counts[media_type] += 1
+                file_name = get_file_name(message)
+                if file_name is None:
+                    continue
 
+                expected_size = None
                 if isinstance(message.media, MessageMediaDocument) and message.media.document:
-                    total_size += message.media.document.size or 0
+                    expected_size = message.media.document.size or 0
+                    total_size += expected_size
 
+                file_path = download_dir / file_name
+
+                # Verificar no log se já foi baixado
+                msg_id_str = str(message.id)
+                if msg_id_str in download_log.get(group_log_key, {}).get("downloaded", {}):
+                    skipped += 1
+                    continue
+
+                if file_path.exists():
+                    if expected_size and file_path.stat().st_size != expected_size:
+                        file_path.unlink()
+                    elif file_path.stat().st_size == 0:
+                        file_path.unlink()
+                    else:
+                        skipped += 1
+                        continue
+
+                pending.append((message.id, media_type, file_name, file_path, expected_size))
+
+            success = True
             break
         except errors.FloodWaitError as e:
             wait_time = e.seconds + 5
@@ -289,26 +430,42 @@ async def get_group_media_stats(client: TelegramClient, group, media_types: list
             await asyncio.sleep(wait_time)
             total_size = 0
             counts = {"video": 0, "photo": 0, "document": 0}
+            pending = []
+            skipped = 0
         except (ConnectionError, TimeoutError, OSError) as e:
-            delay = min(INITIAL_RETRY_DELAY * (2 ** (attempt - 1)), MAX_RETRY_DELAY)
-            print(f"\n  🔌 Erro de conexão ao calcular stats: {e}")
-            print(f"     Tentativa {attempt}/{MAX_RETRIES} — retentando em {delay}s...")
+            delay = min(INITIAL_RETRY_DELAY * (2 ** (attempt_num - 1)), MAX_RETRY_DELAY)
+            print(f"\n  🔌 Erro: {e}, retentando em {delay}s...")
             await asyncio.sleep(delay)
             total_size = 0
             counts = {"video": 0, "photo": 0, "document": 0}
+            pending = []
+            skipped = 0
+
+    if not success:
+        print(" FALHOU!\n")
+        return None, [], 0
 
     print(" OK!\n")
-    return {"total_size": total_size, "counts": counts}
+    return {"total_size": total_size, "counts": counts}, pending, skipped
 
 
 async def download_media_from_group(client: TelegramClient, group, media_types: list[str], limit: int | None, base_dir: Path | None = None):
-    group_name = group.name.replace("/", "_").replace("\\", "_").strip()
+    group_name = sanitize_filename(group.name)
     if base_dir is None:
         base_dir = Path.cwd() / "downloads"
     download_dir = base_dir / group_name
     download_dir.mkdir(parents=True, exist_ok=True)
 
-    stats = await get_group_media_stats(client, group, media_types, limit)
+    # Inicializar log ANTES do scan (o scan precisa consultá-lo)
+    download_log = load_download_log()
+    group_log_key = group_name
+    if group_log_key not in download_log:
+        download_log[group_log_key] = {"downloaded": {}, "failed": {}, "stats": {"completed": 0, "errors": 0}}
+
+    stats, pending, skipped = await scan_group_media(client, group, media_types, limit, download_dir, download_log, group_log_key)
+    if stats is None:
+        print("❌ Falha ao escanear o grupo. Verifique sua conexão.\n")
+        return
 
     total_items = sum(stats["counts"].values())
     if total_items == 0:
@@ -342,6 +499,12 @@ async def download_media_from_group(client: TelegramClient, group, media_types: 
             return
     print()
 
+    if not pending:
+        print(f"✅ Todos os {skipped} arquivos já foram baixados!\n")
+        return
+
+    print(f"  📥 {len(pending)} para baixar | ⏭ {skipped} já existem\n")
+
     try:
         confirma = input("👉 Deseja continuar com o download? (s/n): ").strip().lower()
     except (KeyboardInterrupt, EOFError):
@@ -352,55 +515,16 @@ async def download_media_from_group(client: TelegramClient, group, media_types: 
         print("⏭  Download cancelado.\n")
         return
 
-    print(f"\n📂 Salvando em: {download_dir}")
-    print(f"📋 Preparando lista de downloads...\n")
-
-    pending = []
-    skipped = 0
-
-    async for message in client.iter_messages(group.entity, limit=limit, reverse=True):
-        media_type = classify_media(message)
-        if media_type is None or media_type not in media_types:
-            continue
-
-        file_name = get_file_name(message)
-        if file_name is None:
-            continue
-
-        file_path = download_dir / file_name
-
-        expected_size = None
-        if isinstance(message.media, MessageMediaDocument) and message.media.document:
-            expected_size = message.media.document.size
-
-        if file_path.exists():
-            if expected_size and file_path.stat().st_size != expected_size:
-                print(f"  ⚠  Arquivo incompleto detectado, rebaixando: {file_name}")
-                file_path.unlink()
-            else:
-                skipped += 1
-                continue
-
-        pending.append((message, media_type, file_name, file_path, expected_size))
-
-    if not pending:
-        print(f"✅ Todos os {skipped} arquivos já foram baixados!\n")
-        return
-
-    print(f"  📥 {len(pending)} para baixar | ⏭ {skipped} já existem\n")
+    print(f"\n📂 Salvando em: {download_dir}\n")
 
     downloaded = 0
     error_count = 0
     start_time = time.time()
 
-    download_log = load_download_log()
-    group_log_key = group_name
-    if group_log_key not in download_log:
-        download_log[group_log_key] = {"failed_files": [], "completed": 0, "errors": 0}
-
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
+    counter_lock = asyncio.Lock()
 
-    async def download_one(item_index: int, message, media_type: str, file_name: str, file_path: Path, expected_size: int | None):
+    async def download_one(item_index: int, message_id: int, media_type: str, file_name: str, file_path: Path, expected_size: int | None):
         nonlocal downloaded, error_count
 
         async with semaphore:
@@ -410,30 +534,41 @@ async def download_media_from_group(client: TelegramClient, group, media_types: 
             size_str = f" ({format_size(expected_size)})" if expected_size else ""
             print(f"⬇  [{item_index}/{len(pending)}] [{media_type.upper()}] {file_name}{size_str}")
 
-            success = await download_with_retry(client, message, file_path, expected_size, show_progress=not is_parallel)
+            success = await download_with_retry(client, group.entity, message_id, file_path, expected_size, show_progress=not is_parallel)
 
-            if success:
-                downloaded += 1
-                download_log[group_log_key]["completed"] = downloaded
-                if is_parallel:
-                    print(f"  ✅ {file_name} — concluído ({downloaded}/{len(pending)})")
-            else:
-                error_count += 1
-                download_log[group_log_key]["errors"] = error_count
-                if file_name not in download_log[group_log_key]["failed_files"]:
-                    download_log[group_log_key]["failed_files"].append(file_name)
-                print(f"  💀 Falha permanente após {MAX_RETRIES} tentativas: {file_name}")
+            async with counter_lock:
+                if success:
+                    downloaded += 1
+                    download_log[group_log_key]["downloaded"][str(message_id)] = {
+                        "file": file_name,
+                        "size": file_path.stat().st_size,
+                    }
+                    download_log[group_log_key]["stats"]["completed"] = len(download_log[group_log_key]["downloaded"])
+                    if is_parallel:
+                        print(f"  ✅ {file_name} — concluído ({downloaded}/{len(pending)})")
+                else:
+                    error_count += 1
+                    download_log[group_log_key]["failed"][str(message_id)] = {
+                        "file": file_name,
+                        "error": "falha permanente",
+                    }
+                    download_log[group_log_key]["stats"]["errors"] = len(download_log[group_log_key]["failed"])
+                    print(f"  💀 Falha permanente após {MAX_RETRIES} tentativas: {file_name}")
 
-            if (downloaded + error_count) % 5 == 0:
-                save_download_log(download_log)
+                if (downloaded + error_count) % 5 == 0:
+                    save_download_log(download_log)
 
     tasks = [
-        download_one(i + 1, msg, mt, fn, fp, es)
-        for i, (msg, mt, fn, fp, es) in enumerate(pending)
+        download_one(i + 1, msg_id, mt, fn, fp, es)
+        for i, (msg_id, mt, fn, fp, es) in enumerate(pending)
     ]
-    await asyncio.gather(*tasks)
-
-    save_download_log(download_log)
+    try:
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for r in results:
+            if isinstance(r, Exception):
+                logger.error("Exceção não tratada em task de download: %s", r)
+    finally:
+        save_download_log(download_log)
     elapsed = time.time() - start_time
     elapsed_str = time.strftime("%H:%M:%S", time.gmtime(elapsed))
 
@@ -472,6 +607,10 @@ async def main():
     print(f"\n{'='*50}")
     print("  TELEGRAM GROUP DOWNLOADER")
     print(f"{'='*50}")
+
+    if not check_cryptg():
+        print("  ⚠  cryptg não instalado — downloads podem ser lentos")
+        print("     Instale com: pip install cryptg\n")
 
     me = await client.get_me()
     print(f"  Logado como: {me.first_name} (@{me.username or 'sem username'})")
@@ -570,7 +709,7 @@ async def main():
                 if criar != "s":
                     print("⏭  Download cancelado.\n")
                     continue
-            print(f"  📂 Arquivos serão salvos em: {base_dir / selected.name.replace('/', '_').replace(chr(92), '_').strip()}\n")
+            print(f"  📂 Arquivos serão salvos em: {base_dir / sanitize_filename(selected.name)}\n")
 
         try:
             await download_media_from_group(client, selected, media_types, limit, base_dir)

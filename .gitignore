@@ -5,3 +5,5 @@ __pycache__/
 config.json
 .env
 downloads/
+download_log.json
+downloader.log
