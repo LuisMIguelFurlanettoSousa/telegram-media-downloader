@@ -7,3 +7,5 @@ config.json
 downloads/
 download_log.json
 downloader.log
+drive_token.json
+drive_credentials.json

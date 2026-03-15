@@ -30,6 +30,7 @@ from telethon.tl.types import (
 SESSION_NAME = "telegram_session"
 CONFIG_FILE = Path(__file__).parent / "config.json"
 LOG_FILE = Path(__file__).parent / "download_log.json"
+COURSE_STRUCTURE_FILE = Path(__file__).parent / "course_structure.json"
 
 MAX_RETRIES = 5
 INITIAL_RETRY_DELAY = 5
@@ -53,6 +54,36 @@ MEDIA_FILTERS = {
     "3": {"label": "Apenas documentos/arquivos", "types": ["document"]},
     "4": {"label": "Tudo (vídeos + fotos + documentos)", "types": ["video", "photo", "document"]},
 }
+
+
+def load_course_structure(file_path: Path = COURSE_STRUCTURE_FILE) -> dict | None:
+    if not file_path.exists():
+        return None
+    try:
+        return json.loads(file_path.read_text())
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning("Falha ao carregar estrutura do curso: %s", e)
+        return None
+
+
+def resolve_folder_from_message(message_text: str | None, structure: dict) -> str | None:
+    if not message_text:
+        return None
+
+    tags = re.findall(r'#([A-Za-z]+)(\d+)', message_text)
+    if not tags:
+        return None
+
+    for tag_prefix, tag_number_str in tags:
+        tag_number = int(tag_number_str)
+        for section in structure.get("sections", []):
+            if section["prefix"].lower() != tag_prefix.lower():
+                continue
+            start, end = section["range"]
+            if start <= tag_number <= end:
+                return section["folder"]
+
+    return None
 
 
 def load_credentials() -> tuple[str, str]:
@@ -248,9 +279,15 @@ def check_disk_space(path: Path, required_bytes: int) -> bool:
     return True
 
 
-async def download_with_retry(client: TelegramClient, entity, message_id: int, file_path: Path, expected_size: int | None, show_progress: bool = True) -> bool:
+async def download_with_retry(
+    client: TelegramClient, entity, message_id: int, file_path: Path, expected_size: int | None,
+    show_progress: bool = True, drive_service=None, drive_folder_id: str | None = None,
+    file_name: str | None = None,
+) -> bool:
+    is_drive = drive_service is not None and drive_folder_id is not None
     attempt = 1
     while attempt <= MAX_RETRIES:
+        writer = None
         try:
             fresh_message = await client.get_messages(entity, ids=message_id)
             if fresh_message is None:
@@ -259,6 +296,46 @@ async def download_with_retry(client: TelegramClient, entity, message_id: int, f
                 return False
 
             progress = DownloadProgress() if show_progress else None
+
+            if is_drive:
+                from google_drive_upload import GoogleDriveWriter, get_mime_type
+                mime = get_mime_type(file_name or "arquivo.bin")
+                upload_uri = drive_service.initiate_resumable_upload(
+                    file_name, mime, drive_folder_id, expected_size
+                )
+                writer = GoogleDriveWriter(drive_service, upload_uri, expected_size)
+                result = await client.download_media(
+                    fresh_message,
+                    file=writer,
+                    progress_callback=progress.callback if progress else None,
+                )
+                if show_progress:
+                    print()
+                writer.close()
+
+                if writer.tell() == 0:
+                    logger.warning("Download vazio (Drive): %s (tentativa %d/%d)", file_name, attempt, MAX_RETRIES)
+                    if attempt < MAX_RETRIES:
+                        delay = min(INITIAL_RETRY_DELAY * (2 ** (attempt - 1)), MAX_RETRY_DELAY)
+                        print(f"\n  ⚠  Download vazio: {file_name}")
+                        print(f"     Tentativa {attempt}/{MAX_RETRIES} — retentando em {delay}s...")
+                        await asyncio.sleep(delay)
+                    attempt += 1
+                    continue
+
+                if not writer._finalized:
+                    logger.warning("Upload não finalizado (Drive): %s (tentativa %d/%d)", file_name, attempt, MAX_RETRIES)
+                    if attempt < MAX_RETRIES:
+                        delay = min(INITIAL_RETRY_DELAY * (2 ** (attempt - 1)), MAX_RETRY_DELAY)
+                        print(f"\n  ⚠  Upload não concluído: {file_name}")
+                        print(f"     Tentativa {attempt}/{MAX_RETRIES} — retentando em {delay}s...")
+                        await asyncio.sleep(delay)
+                    attempt += 1
+                    continue
+
+                return True
+
+            # Modo local (original)
             result = await client.download_media(
                 fresh_message,
                 file=str(file_path),
@@ -307,7 +384,7 @@ async def download_with_retry(client: TelegramClient, entity, message_id: int, f
             return True
 
         except asyncio.CancelledError:
-            if file_path.exists():
+            if not is_drive and file_path.exists():
                 file_path.unlink()
                 print(f"\n  🗑  Arquivo incompleto removido: {file_path.name}")
             raise
@@ -316,7 +393,7 @@ async def download_with_retry(client: TelegramClient, entity, message_id: int, f
             wait_time = e.seconds + 5
             print(f"\n  ⏳ Flood wait do Telegram: aguardando {wait_time}s antes de retentar...")
             logger.warning("FloodWaitError: aguardando %ds", wait_time)
-            if file_path.exists():
+            if not is_drive and file_path.exists():
                 file_path.unlink()
             await asyncio.sleep(wait_time)
             # FloodWait NÃO consome tentativa
@@ -326,7 +403,7 @@ async def download_with_retry(client: TelegramClient, entity, message_id: int, f
             print(f"\n  🔌 Erro de conexão: {e}")
             print(f"     Tentativa {attempt}/{MAX_RETRIES} — retentando em {delay}s...")
             logger.warning("Erro de conexão: %s (tentativa %d/%d, retry em %ds)", e, attempt, MAX_RETRIES, delay)
-            if file_path.exists():
+            if not is_drive and file_path.exists():
                 file_path.unlink()
             await asyncio.sleep(delay)
             attempt += 1
@@ -336,12 +413,13 @@ async def download_with_retry(client: TelegramClient, entity, message_id: int, f
             print(f"\n  ❌ Erro inesperado: {e}")
             print(f"     Tentativa {attempt}/{MAX_RETRIES} — retentando em {delay}s...")
             logger.warning("Erro inesperado: %s (tentativa %d/%d)", e, attempt, MAX_RETRIES)
-            if file_path.exists():
+            if not is_drive and file_path.exists():
                 file_path.unlink()
             await asyncio.sleep(delay)
             attempt += 1
 
-    logger.error("Falha permanente após %d tentativas: %s", MAX_RETRIES, file_path.name)
+    display_name = file_name if is_drive else file_path.name
+    logger.error("Falha permanente após %d tentativas: %s", MAX_RETRIES, display_name)
     return False
 
 
@@ -361,12 +439,21 @@ TELETHON_FILTERS = {
 }
 
 
-async def scan_group_media(client: TelegramClient, group, media_types: list[str], limit: int | None, download_dir: Path, download_log: dict, group_log_key: str):
+async def scan_group_media(
+    client: TelegramClient, group, media_types: list[str], limit: int | None,
+    download_dir: Path, download_log: dict, group_log_key: str,
+    course_structure: dict | None = None,
+    drive_service=None, drive_group_folder_id: str | None = None,
+):
     """Escaneia mensagens UMA vez, retornando stats e lista de pendentes."""
     total_size = 0
     counts = {"video": 0, "photo": 0, "document": 0}
     pending = []
     skipped = 0
+    is_drive = drive_service is not None and drive_group_folder_id is not None
+
+    # Cache de arquivos existentes no Drive (por pasta)
+    drive_folder_files: dict[str, dict[str, dict]] = {}
 
     print(f"📊 Escaneando grupo '{group.name}'...", end="", flush=True)
 
@@ -403,24 +490,61 @@ async def scan_group_media(client: TelegramClient, group, media_types: list[str]
                     expected_size = message.media.document.size or 0
                     total_size += expected_size
 
-                file_path = download_dir / file_name
-
                 # Verificar no log se já foi baixado
                 msg_id_str = str(message.id)
                 if msg_id_str in download_log.get(group_log_key, {}).get("downloaded", {}):
                     skipped += 1
                     continue
 
-                if file_path.exists():
-                    if expected_size and file_path.stat().st_size != expected_size:
-                        file_path.unlink()
-                    elif file_path.stat().st_size == 0:
-                        file_path.unlink()
+                if is_drive:
+                    # Modo Drive: resolver pasta e verificar existência no Drive
+                    if course_structure:
+                        subfolder = resolve_folder_from_message(message.text, course_structure)
+                        folder_name = subfolder if subfolder else "_sem_classificacao"
+                        drive_folder_id = drive_service.get_or_create_folder(folder_name, drive_group_folder_id)
                     else:
-                        skipped += 1
-                        continue
+                        drive_folder_id = drive_group_folder_id
 
-                pending.append((message.id, media_type, file_name, file_path, expected_size))
+                    # Cache de listagem por pasta (1 request por pasta, não por arquivo)
+                    if drive_folder_id not in drive_folder_files:
+                        drive_folder_files[drive_folder_id] = drive_service.list_files_in_folder(drive_folder_id)
+
+                    existing = drive_folder_files[drive_folder_id].get(file_name)
+                    if existing:
+                        if expected_size and existing["size"] != expected_size:
+                            pass  # Tamanho diferente, re-baixar
+                        elif existing["size"] == 0:
+                            pass  # Arquivo vazio, re-baixar
+                        else:
+                            skipped += 1
+                            continue
+
+                    pending.append((message.id, media_type, file_name, drive_folder_id, expected_size))
+                else:
+                    # Modo local: resolver subpasta no disco
+                    if course_structure:
+                        subfolder = resolve_folder_from_message(message.text, course_structure)
+                        if subfolder:
+                            target_dir = download_dir / subfolder
+                            target_dir.mkdir(parents=True, exist_ok=True)
+                        else:
+                            target_dir = download_dir / "_sem_classificacao"
+                            target_dir.mkdir(parents=True, exist_ok=True)
+                    else:
+                        target_dir = download_dir
+
+                    file_path = target_dir / file_name
+
+                    if file_path.exists():
+                        if expected_size and file_path.stat().st_size != expected_size:
+                            file_path.unlink()
+                        elif file_path.stat().st_size == 0:
+                            file_path.unlink()
+                        else:
+                            skipped += 1
+                            continue
+
+                    pending.append((message.id, media_type, file_name, file_path, expected_size))
 
             success = True
             break
@@ -432,6 +556,7 @@ async def scan_group_media(client: TelegramClient, group, media_types: list[str]
             counts = {"video": 0, "photo": 0, "document": 0}
             pending = []
             skipped = 0
+            drive_folder_files.clear()
         except (ConnectionError, TimeoutError, OSError) as e:
             delay = min(INITIAL_RETRY_DELAY * (2 ** (attempt_num - 1)), MAX_RETRY_DELAY)
             print(f"\n  🔌 Erro: {e}, retentando em {delay}s...")
@@ -440,6 +565,7 @@ async def scan_group_media(client: TelegramClient, group, media_types: list[str]
             counts = {"video": 0, "photo": 0, "document": 0}
             pending = []
             skipped = 0
+            drive_folder_files.clear()
 
     if not success:
         print(" FALHOU!\n")
@@ -449,12 +575,23 @@ async def scan_group_media(client: TelegramClient, group, media_types: list[str]
     return {"total_size": total_size, "counts": counts}, pending, skipped
 
 
-async def download_media_from_group(client: TelegramClient, group, media_types: list[str], limit: int | None, base_dir: Path | None = None):
+async def download_media_from_group(
+    client: TelegramClient, group, media_types: list[str], limit: int | None,
+    base_dir: Path | None = None, course_structure: dict | None = None,
+    drive_service=None, drive_root_folder_id: str | None = None,
+):
     group_name = sanitize_filename(group.name)
-    if base_dir is None:
-        base_dir = Path.cwd() / "downloads"
-    download_dir = base_dir / group_name
-    download_dir.mkdir(parents=True, exist_ok=True)
+    is_drive = drive_service is not None and drive_root_folder_id is not None
+
+    if is_drive:
+        download_dir = Path.cwd()  # Placeholder, não será usado para salvar arquivos
+        drive_group_folder_id = drive_service.get_or_create_folder(group_name, drive_root_folder_id)
+    else:
+        if base_dir is None:
+            base_dir = Path.cwd() / "downloads"
+        download_dir = base_dir / group_name
+        download_dir.mkdir(parents=True, exist_ok=True)
+        drive_group_folder_id = None
 
     # Inicializar log ANTES do scan (o scan precisa consultá-lo)
     download_log = load_download_log()
@@ -462,7 +599,14 @@ async def download_media_from_group(client: TelegramClient, group, media_types: 
     if group_log_key not in download_log:
         download_log[group_log_key] = {"downloaded": {}, "failed": {}, "stats": {"completed": 0, "errors": 0}}
 
-    stats, pending, skipped = await scan_group_media(client, group, media_types, limit, download_dir, download_log, group_log_key)
+    if course_structure:
+        num_sections = len(course_structure.get("sections", []))
+        print(f"📁 Estrutura de pastas ativa: {num_sections} seções configuradas\n")
+
+    stats, pending, skipped = await scan_group_media(
+        client, group, media_types, limit, download_dir, download_log, group_log_key,
+        course_structure, drive_service, drive_group_folder_id,
+    )
     if stats is None:
         print("❌ Falha ao escanear o grupo. Verifique sua conexão.\n")
         return
@@ -486,9 +630,11 @@ async def download_media_from_group(client: TelegramClient, group, media_types: 
     is_parallel = MAX_CONCURRENT_DOWNLOADS > 1
     if is_parallel:
         print(f"  🚀 Modo:       {MAX_CONCURRENT_DOWNLOADS} downloads simultâneos")
+    if is_drive:
+        print(f"  ☁️  Destino:    Google Drive")
     print(f"  {'='*45}")
 
-    if stats["total_size"] > 0 and not check_disk_space(download_dir, stats["total_size"]):
+    if not is_drive and stats["total_size"] > 0 and not check_disk_space(download_dir, stats["total_size"]):
         try:
             cont = input("\n  Deseja continuar mesmo assim? (s/n): ").strip().lower()
         except (KeyboardInterrupt, EOFError):
@@ -515,7 +661,10 @@ async def download_media_from_group(client: TelegramClient, group, media_types: 
         print("⏭  Download cancelado.\n")
         return
 
-    print(f"\n📂 Salvando em: {download_dir}\n")
+    if is_drive:
+        print(f"\n☁️  Salvando no Google Drive\n")
+    else:
+        print(f"\n📂 Salvando em: {download_dir}\n")
 
     downloaded = 0
     error_count = 0
@@ -524,7 +673,7 @@ async def download_media_from_group(client: TelegramClient, group, media_types: 
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
     counter_lock = asyncio.Lock()
 
-    async def download_one(item_index: int, message_id: int, media_type: str, file_name: str, file_path: Path, expected_size: int | None):
+    async def download_one(item_index: int, message_id: int, media_type: str, file_name: str, file_path_or_folder_id, expected_size: int | None):
         nonlocal downloaded, error_count
 
         async with semaphore:
@@ -534,15 +683,32 @@ async def download_media_from_group(client: TelegramClient, group, media_types: 
             size_str = f" ({format_size(expected_size)})" if expected_size else ""
             print(f"⬇  [{item_index}/{len(pending)}] [{media_type.upper()}] {file_name}{size_str}")
 
-            success = await download_with_retry(client, group.entity, message_id, file_path, expected_size, show_progress=not is_parallel)
+            if is_drive:
+                success = await download_with_retry(
+                    client, group.entity, message_id, None, expected_size,
+                    show_progress=not is_parallel,
+                    drive_service=drive_service, drive_folder_id=file_path_or_folder_id,
+                    file_name=file_name,
+                )
+            else:
+                success = await download_with_retry(
+                    client, group.entity, message_id, file_path_or_folder_id, expected_size,
+                    show_progress=not is_parallel,
+                )
 
             async with counter_lock:
                 if success:
                     downloaded += 1
-                    download_log[group_log_key]["downloaded"][str(message_id)] = {
-                        "file": file_name,
-                        "size": file_path.stat().st_size,
-                    }
+                    if is_drive:
+                        download_log[group_log_key]["downloaded"][str(message_id)] = {
+                            "file": file_name,
+                            "size": expected_size or 0,
+                        }
+                    else:
+                        download_log[group_log_key]["downloaded"][str(message_id)] = {
+                            "file": file_name,
+                            "size": file_path_or_folder_id.stat().st_size,
+                        }
                     download_log[group_log_key]["stats"]["completed"] = len(download_log[group_log_key]["downloaded"])
                     if is_parallel:
                         print(f"  ✅ {file_name} — concluído ({downloaded}/{len(pending)})")
@@ -559,8 +725,8 @@ async def download_media_from_group(client: TelegramClient, group, media_types: 
                     save_download_log(download_log)
 
     tasks = [
-        download_one(i + 1, msg_id, mt, fn, fp, es)
-        for i, (msg_id, mt, fn, fp, es) in enumerate(pending)
+        download_one(i + 1, msg_id, mt, fn, fp_or_fid, es)
+        for i, (msg_id, mt, fn, fp_or_fid, es) in enumerate(pending)
     ]
     try:
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -578,7 +744,10 @@ async def download_media_from_group(client: TelegramClient, group, media_types: 
     if error_count:
         print(f"❌ Erros (após {MAX_RETRIES} tentativas cada): {error_count}")
     print(f"⏱  Tempo total: {elapsed_str}")
-    print(f"📂 Pasta: {download_dir}")
+    if is_drive:
+        print(f"☁️  Destino: Google Drive")
+    else:
+        print(f"📂 Pasta: {download_dir}")
 
 
 async def main():
@@ -687,32 +856,83 @@ async def main():
         if limit and not limit_input.isdigit():
             print(f"  (valor inválido, usando padrão: {limit})")
 
-        print(f"\nOnde deseja salvar os arquivos?")
-        print(f"  - Digite o caminho completo da pasta (ex: /home/usuario/cursos)")
-        print(f"  - Ou pressione ENTER para usar o padrão (./downloads)\n")
+        # Opção Google Drive
+        drive_service = None
+        drive_root_folder_id = None
 
+        print(f"\nDeseja enviar direto para o Google Drive? (sem usar disco local)")
         try:
-            dir_input = input("👉 Pasta de destino: ").strip()
+            usar_drive = input("👉 Google Drive? (s/n) [n]: ").strip().lower()
         except (KeyboardInterrupt, EOFError):
             print("\nSaindo...")
             break
 
+        if usar_drive == "s":
+            from google_drive_upload import GoogleDriveService
+            drive_service = GoogleDriveService()
+            if not drive_service.authenticate():
+                print("❌ Falha na autenticação com o Google Drive.\n")
+                continue
+
+            try:
+                drive_folder_name = input("👉 Nome da pasta raiz no Drive [Telegram Downloads]: ").strip()
+            except (KeyboardInterrupt, EOFError):
+                print("\nSaindo...")
+                break
+            if not drive_folder_name:
+                drive_folder_name = "Telegram Downloads"
+
+            drive_root_folder_id = drive_service.get_or_create_folder(drive_folder_name)
+            print(f"  ☁️  Pasta raiz no Drive: {drive_folder_name}\n")
+
         base_dir = None
-        if dir_input:
-            base_dir = Path(dir_input).expanduser().resolve()
-            if not base_dir.exists():
-                try:
-                    criar = input(f"  📁 A pasta '{base_dir}' não existe. Deseja criá-la? (s/n): ").strip().lower()
-                except (KeyboardInterrupt, EOFError):
-                    print("\nSaindo...")
-                    break
-                if criar != "s":
-                    print("⏭  Download cancelado.\n")
-                    continue
-            print(f"  📂 Arquivos serão salvos em: {base_dir / sanitize_filename(selected.name)}\n")
+        if drive_service is None:
+            print(f"Onde deseja salvar os arquivos?")
+            print(f"  - Digite o caminho completo da pasta (ex: /home/usuario/cursos)")
+            print(f"  - Ou pressione ENTER para usar o padrão (./downloads)\n")
+
+            try:
+                dir_input = input("👉 Pasta de destino: ").strip()
+            except (KeyboardInterrupt, EOFError):
+                print("\nSaindo...")
+                break
+
+            if dir_input:
+                base_dir = Path(dir_input).expanduser().resolve()
+                if not base_dir.exists():
+                    try:
+                        criar = input(f"  📁 A pasta '{base_dir}' não existe. Deseja criá-la? (s/n): ").strip().lower()
+                    except (KeyboardInterrupt, EOFError):
+                        print("\nSaindo...")
+                        break
+                    if criar != "s":
+                        print("⏭  Download cancelado.\n")
+                        continue
+                print(f"  📂 Arquivos serão salvos em: {base_dir / sanitize_filename(selected.name)}\n")
+
+        # Verificar se existe estrutura de curso
+        course_structure = None
+        structure_data = load_course_structure()
+        if structure_data:
+            num_sections = len(structure_data.get("sections", []))
+            print(f"📁 Arquivo course_structure.json encontrado ({num_sections} seções).")
+            print(f"   Os downloads serão organizados em subpastas por módulo.\n")
+            try:
+                usar_estrutura = input("👉 Usar organização por pastas? (s/n): ").strip().lower()
+            except (KeyboardInterrupt, EOFError):
+                print("\nSaindo...")
+                break
+            if usar_estrutura == "s":
+                course_structure = structure_data
+                print("  ✅ Organização por pastas ativada!\n")
+            else:
+                print("  ⏭  Downloads serão salvos em pasta única.\n")
 
         try:
-            await download_media_from_group(client, selected, media_types, limit, base_dir)
+            await download_media_from_group(
+                client, selected, media_types, limit, base_dir, course_structure,
+                drive_service, drive_root_folder_id,
+            )
         except (ConnectionError, TimeoutError, OSError) as e:
             logger.error("Conexão perdida durante download: %s", e)
             print(f"\n🔌 Conexão perdida: {e}")
