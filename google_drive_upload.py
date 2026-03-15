@@ -5,10 +5,12 @@ Permite fazer upload de arquivos em chunks sem salvar no disco local,
 usando a API de resumable upload do Google Drive v3.
 """
 
-import io
 import json
 import logging
 import mimetypes
+import queue
+import random
+import threading
 import time
 from pathlib import Path
 
@@ -26,7 +28,7 @@ CHUNK_SIZE = 10 * 1024 * 1024  # 10MB - múltiplo de 256KB conforme exigido pela
 MAX_UPLOAD_RETRIES = 5
 INITIAL_UPLOAD_RETRY_DELAY = 2
 
-RETRYABLE_STATUS_CODES = {500, 502, 503, 504}
+RETRYABLE_STATUS_CODES = {403, 429, 500, 502, 503, 504}
 
 
 class GoogleDriveService:
@@ -186,11 +188,12 @@ class GoogleDriveService:
 
                 if response.status_code in RETRYABLE_STATUS_CODES:
                     delay = INITIAL_UPLOAD_RETRY_DELAY * (2 ** (attempt - 1))
+                    jitter = random.uniform(0, delay * 0.3)
                     logger.warning(
-                        "Erro retentável %d no chunk (offset=%d), tentativa %d/%d, aguardando %ds",
-                        response.status_code, offset, attempt, MAX_UPLOAD_RETRIES, delay,
+                        "Erro retentável %d no chunk (offset=%d), tentativa %d/%d, aguardando %.1fs",
+                        response.status_code, offset, attempt, MAX_UPLOAD_RETRIES, delay + jitter,
                     )
-                    time.sleep(delay)
+                    time.sleep(delay + jitter)
                     continue
 
                 response.raise_for_status()
@@ -199,8 +202,9 @@ class GoogleDriveService:
                 if attempt >= MAX_UPLOAD_RETRIES:
                     raise
                 delay = INITIAL_UPLOAD_RETRY_DELAY * (2 ** (attempt - 1))
-                logger.warning("Erro no upload chunk (offset=%d): %s, retentando em %ds", offset, e, delay)
-                time.sleep(delay)
+                jitter = random.uniform(0, delay * 0.3)
+                logger.warning("Erro no upload chunk (offset=%d): %s, retentando em %.1fs", offset, e, delay + jitter)
+                time.sleep(delay + jitter)
 
         raise RuntimeError(f"Falha ao enviar chunk após {MAX_UPLOAD_RETRIES} tentativas")
 
@@ -223,8 +227,9 @@ class GoogleDriveService:
 
                 if response.status_code in RETRYABLE_STATUS_CODES:
                     delay = INITIAL_UPLOAD_RETRY_DELAY * (2 ** (attempt - 1))
+                    jitter = random.uniform(0, delay * 0.3)
                     logger.warning("Erro retentável %d no chunk final, tentativa %d/%d", response.status_code, attempt, MAX_UPLOAD_RETRIES)
-                    time.sleep(delay)
+                    time.sleep(delay + jitter)
                     continue
 
                 response.raise_for_status()
@@ -233,10 +238,14 @@ class GoogleDriveService:
                 if attempt >= MAX_UPLOAD_RETRIES:
                     raise
                 delay = INITIAL_UPLOAD_RETRY_DELAY * (2 ** (attempt - 1))
-                logger.warning("Erro no chunk final: %s, retentando em %ds", e, delay)
-                time.sleep(delay)
+                jitter = random.uniform(0, delay * 0.3)
+                logger.warning("Erro no chunk final: %s, retentando em %.1fs", e, delay + jitter)
+                time.sleep(delay + jitter)
 
         raise RuntimeError(f"Falha ao finalizar upload após {MAX_UPLOAD_RETRIES} tentativas")
+
+
+_SENTINEL = object()
 
 
 class GoogleDriveWriter:
@@ -244,59 +253,103 @@ class GoogleDriveWriter:
 
     O Telethon chama write(data) repetidamente durante o download.
     Os dados são bufferizados e enviados em chunks de 10MB ao Drive.
+
+    Usa uma thread dedicada de upload para não bloquear o event loop do asyncio.
+    Usa bytearray para evitar cópias desnecessárias de memória.
     """
 
     def __init__(self, drive_service: GoogleDriveService, upload_uri: str, total_size: int | None = None):
         self._drive = drive_service
         self._upload_uri = upload_uri
         self._total_size = total_size
-        self._buffer = io.BytesIO()
+        self._buffer = bytearray()
         self._bytes_uploaded = 0
         self._finalized = False
+        self._error: Exception | None = None
+
+        # Thread dedicada para upload — não bloqueia o event loop
+        self._upload_queue: queue.Queue = queue.Queue(maxsize=2)
+        self._upload_thread = threading.Thread(target=self._upload_worker, daemon=True)
+        self._upload_thread.start()
 
     def write(self, data: bytes) -> int:
-        """Bufferiza dados e envia chunks de CHUNK_SIZE ao Drive."""
-        self._buffer.write(data)
+        """Bufferiza dados e envia chunks de CHUNK_SIZE ao Drive via thread."""
+        if self._error:
+            raise self._error
 
-        while self._buffer.tell() >= CHUNK_SIZE:
-            self._flush_chunk(CHUNK_SIZE)
+        self._buffer.extend(data)
+
+        while len(self._buffer) >= CHUNK_SIZE:
+            chunk = bytes(self._buffer[:CHUNK_SIZE])
+            del self._buffer[:CHUNK_SIZE]
+            self._upload_queue.put(("chunk", chunk, self._bytes_uploaded))
+            self._bytes_uploaded += len(chunk)
 
         return len(data)
 
     def tell(self) -> int:
         """Retorna total de bytes processados (enviados + buffer). Necessário pelo Telethon."""
-        return self._bytes_uploaded + self._buffer.tell()
+        return self._bytes_uploaded + len(self._buffer)
 
     def close(self):
-        """Envia o buffer restante como chunk final."""
+        """Envia o buffer restante como chunk final e aguarda a thread finalizar."""
         if self._finalized:
             return
 
-        remaining = self._buffer.getvalue()
-
-        if len(remaining) > 0:
-            total = self._bytes_uploaded + len(remaining)
-            result = self._drive.finalize_upload(
-                self._upload_uri, remaining, self._bytes_uploaded, total
-            )
+        if len(self._buffer) > 0:
+            total = self._bytes_uploaded + len(self._buffer)
+            remaining = bytes(self._buffer)
+            self._buffer.clear()
+            self._upload_queue.put(("finalize", remaining, self._bytes_uploaded, total))
             self._bytes_uploaded += len(remaining)
-            self._finalized = result is not None
         elif self._bytes_uploaded > 0:
             self._finalized = True
 
-        self._buffer.close()
+        # Sinalizar fim da thread e aguardar
+        self._upload_queue.put(_SENTINEL)
+        self._upload_thread.join(timeout=300)
 
-    def _flush_chunk(self, size: int):
-        """Extrai `size` bytes do buffer e envia ao Drive."""
-        all_data = self._buffer.getvalue()
-        chunk = all_data[:size]
-        remaining = all_data[size:]
+        if self._error:
+            raise self._error
 
-        self._buffer = io.BytesIO()
-        self._buffer.write(remaining)
+        if not self._finalized and self._bytes_uploaded > 0:
+            self._finalized = True
 
-        self._drive.upload_chunk(self._upload_uri, chunk, self._bytes_uploaded, self._total_size)
-        self._bytes_uploaded += len(chunk)
+    def release_buffer(self):
+        """Libera recursos. Chamado em caso de erro para evitar leak."""
+        self._buffer.clear()
+        # Drenar a fila e sinalizar fim
+        while not self._upload_queue.empty():
+            try:
+                self._upload_queue.get_nowait()
+            except queue.Empty:
+                break
+        self._upload_queue.put(_SENTINEL)
+        self._upload_thread.join(timeout=10)
+
+    def _upload_worker(self):
+        """Thread dedicada que processa a fila de chunks para upload."""
+        while True:
+            item = self._upload_queue.get()
+
+            if item is _SENTINEL:
+                break
+
+            try:
+                if item[0] == "chunk":
+                    _, chunk_data, offset = item
+                    self._drive.upload_chunk(
+                        self._upload_uri, chunk_data, offset, self._total_size
+                    )
+                elif item[0] == "finalize":
+                    _, chunk_data, offset, total = item
+                    result = self._drive.finalize_upload(
+                        self._upload_uri, chunk_data, offset, total
+                    )
+                    self._finalized = result is not None
+            except Exception as e:
+                self._error = e
+                break
 
 
 def get_mime_type(file_name: str) -> str:

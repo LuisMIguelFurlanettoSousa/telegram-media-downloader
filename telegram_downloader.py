@@ -304,14 +304,18 @@ async def download_with_retry(
                     file_name, mime, drive_folder_id, expected_size
                 )
                 writer = GoogleDriveWriter(drive_service, upload_uri, expected_size)
-                result = await client.download_media(
-                    fresh_message,
-                    file=writer,
-                    progress_callback=progress.callback if progress else None,
-                )
-                if show_progress:
-                    print()
-                writer.close()
+                try:
+                    result = await client.download_media(
+                        fresh_message,
+                        file=writer,
+                        progress_callback=progress.callback if progress else None,
+                    )
+                    if show_progress:
+                        print()
+                    writer.close()
+                except Exception:
+                    writer.release_buffer()
+                    raise
 
                 if writer.tell() == 0:
                     logger.warning("Download vazio (Drive): %s (tentativa %d/%d)", file_name, attempt, MAX_RETRIES)
@@ -670,13 +674,24 @@ async def download_media_from_group(
     error_count = 0
     start_time = time.time()
 
-    semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
+    download_queue: asyncio.Queue = asyncio.Queue()
     counter_lock = asyncio.Lock()
 
-    async def download_one(item_index: int, message_id: int, media_type: str, file_name: str, file_path_or_folder_id, expected_size: int | None):
+    # Enfileirar todos os itens pendentes
+    for i, (msg_id, mt, fn, fp_or_fid, es) in enumerate(pending):
+        await download_queue.put((i + 1, msg_id, mt, fn, fp_or_fid, es))
+
+    async def worker(worker_id: int):
         nonlocal downloaded, error_count
 
-        async with semaphore:
+        while True:
+            try:
+                item = download_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+            item_index, message_id, media_type, file_name, file_path_or_folder_id, expected_size = item
+
             if is_parallel:
                 await asyncio.sleep(DOWNLOAD_DELAY)
 
@@ -721,18 +736,14 @@ async def download_media_from_group(
                     download_log[group_log_key]["stats"]["errors"] = len(download_log[group_log_key]["failed"])
                     print(f"  💀 Falha permanente após {MAX_RETRIES} tentativas: {file_name}")
 
-                if (downloaded + error_count) % 5 == 0:
-                    save_download_log(download_log)
+                save_download_log(download_log)
 
-    tasks = [
-        download_one(i + 1, msg_id, mt, fn, fp_or_fid, es)
-        for i, (msg_id, mt, fn, fp_or_fid, es) in enumerate(pending)
-    ]
+    workers = [asyncio.create_task(worker(i)) for i in range(MAX_CONCURRENT_DOWNLOADS)]
     try:
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        results = await asyncio.gather(*workers, return_exceptions=True)
         for r in results:
             if isinstance(r, Exception):
-                logger.error("Exceção não tratada em task de download: %s", r)
+                logger.error("Exceção não tratada em worker de download: %s", r)
     finally:
         save_download_log(download_log)
     elapsed = time.time() - start_time
