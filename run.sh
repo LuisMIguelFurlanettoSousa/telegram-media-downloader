@@ -33,4 +33,7 @@ if [ ! -d "$VENV_DIR" ]; then
     echo ""
 fi
 
+# Garante que dependências novas sejam instaladas
+"$VENV_DIR/bin/pip" install --quiet -r "$REQUIREMENTS" 2>/dev/null
+
 "$VENV_DIR/bin/python" telegram_downloader.py
