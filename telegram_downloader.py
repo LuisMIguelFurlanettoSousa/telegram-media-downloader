@@ -4,6 +4,7 @@ Telegram Group Downloader
 Baixa vídeos e arquivos de grupos do Telegram via API (MTProto).
 """
 
+import atexit
 import os
 import re
 import sys
@@ -39,15 +40,45 @@ MAX_RETRY_DELAY = 300
 MAX_CONCURRENT_DOWNLOADS = 10
 DOWNLOAD_DELAY = 1.0
 
-logging.basicConfig(
-    level=logging.WARNING,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(Path(__file__).parent / "downloader.log"),
-        logging.StreamHandler(),
-    ],
-)
 logger = logging.getLogger(__name__)
+LOGS_DIR = Path(__file__).parent / "logs"
+
+
+def setup_logging() -> Path:
+    """Cria um arquivo de log novo para esta execução (logs/downloader_AAAAMMDD_HHMMSS.log).
+
+    Arquivo: INFO+ (grupos, opções, cada arquivo baixado, erros). Terminal: só WARNING+.
+    """
+    LOGS_DIR.mkdir(exist_ok=True)
+    log_path = LOGS_DIR / f"downloader_{time.strftime('%Y%m%d_%H%M%S')}.log"
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setLevel(logging.INFO)
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.WARNING)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[file_handler, console_handler],
+    )
+    logging.getLogger("telethon").setLevel(logging.WARNING)
+    logger.info("Execução iniciada (log: %s)", log_path.name)
+    atexit.register(logger.info, "Execução encerrada")
+    return log_path
+
+
+def log_selection(queue, media_label: str, limit, destination: str, course_structure, post_actions):
+    """Registra no log os grupos e as opções escolhidas para este lote de downloads."""
+    logger.info("=" * 60)
+    logger.info("Novo lote de downloads: %d grupo(s)", len(queue))
+    for n, g in enumerate(queue, 1):
+        logger.info("  Grupo %d/%d: %s", n, len(queue), g.name)
+    logger.info("Mídia: %s", media_label)
+    logger.info("Limite de mensagens: %s", limit if limit else "todas")
+    logger.info("Destino: %s", destination)
+    logger.info("Organização por pastas (course_structure): %s", "sim" if course_structure else "não")
+    logger.info("Downloads simultâneos: %d", MAX_CONCURRENT_DOWNLOADS)
+    logger.info("Ação ao terminar: %s", ", ".join(POST_ACTIONS[k] for k in sorted(post_actions)))
+    logger.info("=" * 60)
 
 MEDIA_FILTERS = {
     "1": {"label": "Apenas vídeos", "types": ["video"]},
@@ -685,10 +716,16 @@ async def download_media_from_group(
         course_structure, drive_service, drive_group_folder_id,
     )
     if stats is None:
+        logger.error("Grupo '%s': falha ao escanear", group.name)
         print("❌ Falha ao escanear o grupo. Verifique sua conexão.\n")
         return 1
 
     total_items = sum(stats["counts"].values())
+    logger.info(
+        "Grupo '%s': %d vídeos, %d fotos, %d documentos (~%s) | %d para baixar, %d já existiam",
+        group.name, stats["counts"]["video"], stats["counts"]["photo"], stats["counts"]["document"],
+        format_size(stats["total_size"]), len(pending), skipped,
+    )
     if total_items == 0:
         print("❌ Nenhuma mídia encontrada com os filtros selecionados.\n")
         return 0
@@ -762,6 +799,7 @@ async def download_media_from_group(
                 await asyncio.sleep(DOWNLOAD_DELAY)
 
             size_str = f" ({format_size(expected_size)})" if expected_size else ""
+            logger.info("Iniciando [%d/%d] %s%s", item_index, len(pending), file_name, size_str)
             live.log(f"⬇  [{item_index}/{len(pending)}] [{media_type.upper()}] {file_name}{size_str}")
 
             if is_drive:
@@ -789,6 +827,7 @@ async def download_media_from_group(
                             "size": file_path_or_folder_id.stat().st_size,
                         }
                     download_log[group_log_key]["stats"]["completed"] = len(download_log[group_log_key]["downloaded"])
+                    logger.info("Concluído (%d/%d): %s", downloaded, len(pending), file_name)
                     if is_parallel:
                         live.log(f"  ✅ {file_name} — concluído ({downloaded}/{len(pending)})")
                 else:
@@ -817,6 +856,10 @@ async def download_media_from_group(
     elapsed = time.time() - start_time
     elapsed_str = time.strftime("%H:%M:%S", time.gmtime(elapsed))
 
+    logger.info(
+        "Grupo '%s' finalizado: baixados=%d, pulados=%d, erros=%d, tempo=%s",
+        group.name, downloaded, skipped, error_count, elapsed_str,
+    )
     print(f"\n{'='*50}")
     print(f"✅ Baixados: {downloaded}")
     print(f"⏭  Já existiam (pulados): {skipped}")
@@ -903,6 +946,7 @@ def run_post_actions(actions: set[str], summary: str):
 
 
 async def main():
+    setup_logging()
     api_id, api_hash = load_credentials()
 
     client = TelegramClient(
@@ -1088,6 +1132,12 @@ async def main():
         if post_actions is None:
             print("\nSaindo...")
             break
+
+        if drive_service is not None:
+            destination = f"Google Drive (pasta raiz: {drive_folder_name})"
+        else:
+            destination = str(base_dir or Path.cwd() / "downloads")
+        log_selection(queue, MEDIA_FILTERS[media_choice]["label"], limit, destination, course_structure, post_actions)
 
         failed_groups: list[str] = []
         for pos, selected in enumerate(queue, 1):
