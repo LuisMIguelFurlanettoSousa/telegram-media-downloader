@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import shutil
+import subprocess
 import time
 from pathlib import Path
 
@@ -35,7 +36,7 @@ COURSE_STRUCTURE_FILE = Path(__file__).parent / "course_structure.json"
 MAX_RETRIES = 5
 INITIAL_RETRY_DELAY = 5
 MAX_RETRY_DELAY = 300
-MAX_CONCURRENT_DOWNLOADS = 3
+MAX_CONCURRENT_DOWNLOADS = 10
 DOWNLOAD_DELAY = 1.0
 
 logging.basicConfig(
@@ -579,7 +580,12 @@ async def download_media_from_group(
     client: TelegramClient, group, media_types: list[str], limit: int | None,
     base_dir: Path | None = None, course_structure: dict | None = None,
     drive_service=None, drive_root_folder_id: str | None = None,
-):
+    interactive: bool = True,
+) -> int:
+    """Baixa a mídia de um grupo. Retorna o número de falhas (0 = tudo certo).
+
+    Com interactive=False (modo fila) não pede confirmação: segue direto.
+    """
     group_name = sanitize_filename(group.name)
     is_drive = drive_service is not None and drive_root_folder_id is not None
 
@@ -609,12 +615,12 @@ async def download_media_from_group(
     )
     if stats is None:
         print("❌ Falha ao escanear o grupo. Verifique sua conexão.\n")
-        return
+        return 1
 
     total_items = sum(stats["counts"].values())
     if total_items == 0:
         print("❌ Nenhuma mídia encontrada com os filtros selecionados.\n")
-        return
+        return 0
 
     print(f"  {'='*45}")
     print(f"  RESUMO DO GRUPO")
@@ -635,31 +641,35 @@ async def download_media_from_group(
     print(f"  {'='*45}")
 
     if not is_drive and stats["total_size"] > 0 and not check_disk_space(download_dir, stats["total_size"]):
+        if not interactive:
+            print("⏭  Grupo pulado por falta de espaço em disco.\n")
+            return 1
         try:
             cont = input("\n  Deseja continuar mesmo assim? (s/n): ").strip().lower()
         except (KeyboardInterrupt, EOFError):
             print("\nCancelado.")
-            return
+            return 0
         if cont != "s":
             print("⏭  Download cancelado.\n")
-            return
+            return 0
     print()
 
     if not pending:
         print(f"✅ Todos os {skipped} arquivos já foram baixados!\n")
-        return
+        return 0
 
     print(f"  📥 {len(pending)} para baixar | ⏭ {skipped} já existem\n")
 
-    try:
-        confirma = input("👉 Deseja continuar com o download? (s/n): ").strip().lower()
-    except (KeyboardInterrupt, EOFError):
-        print("\nCancelado.")
-        return
+    if interactive:
+        try:
+            confirma = input("👉 Deseja continuar com o download? (s/n): ").strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            print("\nCancelado.")
+            return 0
 
-    if confirma != "s":
-        print("⏭  Download cancelado.\n")
-        return
+        if confirma != "s":
+            print("⏭  Download cancelado.\n")
+            return 0
 
     if is_drive:
         print(f"\n☁️  Salvando no Google Drive\n")
@@ -748,6 +758,79 @@ async def download_media_from_group(
         print(f"☁️  Destino: Google Drive")
     else:
         print(f"📂 Pasta: {download_dir}")
+    return error_count
+
+
+def parse_selection(text: str, total: int) -> list[int] | None:
+    """'3' ou '1,4,7' ou '2-5,9' (base 1) -> índices base 0 sem repetição; None se inválido."""
+    result: list[int] = []
+    for part in text.replace(" ", "").split(","):
+        if not part:
+            return None
+        if "-" in part:
+            a, _, b = part.partition("-")
+            if not (a.isdigit() and b.isdigit()):
+                return None
+            nums = range(int(a), int(b) + 1)
+        elif part.isdigit():
+            nums = [int(part)]
+        else:
+            return None
+        for n in nums:
+            if n < 1 or n > total:
+                return None
+            if n - 1 not in result:
+                result.append(n - 1)
+    return result or None
+
+
+POST_ACTIONS = {
+    "1": "Nada (só sair)",
+    "2": "Desligar a máquina",
+    "3": "Suspender",
+    "4": "Notificação desktop",
+}
+
+
+def ask_post_actions() -> set[str] | None:
+    """Pergunta o que fazer ao fim. Retorna chaves de POST_ACTIONS ('1'..'4'); None = cancelado."""
+    print("\nO que fazer quando terminar? (pode combinar, ex: 4,2)")
+    for k, v in POST_ACTIONS.items():
+        print(f"  {k}. {v}")
+    try:
+        raw = input("👉 Ação [1]: ").strip() or "1"
+    except (KeyboardInterrupt, EOFError):
+        return None
+    chosen = {c for c in raw.replace(" ", "").split(",") if c}
+    if not chosen or not chosen <= POST_ACTIONS.keys():
+        print("  (opção inválida, usando: Nada)")
+        return {"1"}
+    if "2" in chosen and "3" in chosen:
+        print("  (desligar e suspender juntos: usando só desligar)")
+        chosen.discard("3")
+    return chosen
+
+
+def run_post_actions(actions: set[str], summary: str):
+    if "4" in actions:
+        if shutil.which("notify-send"):
+            subprocess.run(["notify-send", "Telegram Downloader", summary], check=False)
+        else:
+            print("  ⚠  notify-send não encontrado (apt install libnotify-bin)")
+    for key, cmd in (("2", ["systemctl", "poweroff"]), ("3", ["systemctl", "suspend"])):
+        if key not in actions:
+            continue
+        label = POST_ACTIONS[key].lower()
+        print(f"\n⚠️  Vou {label} em 60s. Ctrl+C para cancelar.")
+        try:
+            for remaining in range(60, 0, -1):
+                print(f"\r   {remaining:2d}s ", end="", flush=True)
+                time.sleep(1)
+        except KeyboardInterrupt:
+            print(f"\n   ✋ {label.capitalize()} cancelado.")
+            return
+        print()
+        subprocess.run(cmd, check=False)
 
 
 async def main():
@@ -802,9 +885,10 @@ async def main():
             print(f"  {i:3d}. [{tipo}] {g.name}{member_count}")
 
         print(f"\n  0. Sair\n")
+        print("  Dica: vários de uma vez para fila, ex: 1,4,7 ou 2-5")
 
         try:
-            choice = input("👉 Escolha o número do grupo: ").strip()
+            choice = input("👉 Escolha o(s) número(s) do grupo: ").strip()
         except (KeyboardInterrupt, EOFError):
             print("\nSaindo...")
             break
@@ -812,17 +896,20 @@ async def main():
         if choice == "0":
             break
 
-        try:
-            idx = int(choice) - 1
-            if idx < 0 or idx >= len(groups):
-                print("❌ Número inválido.\n")
-                continue
-        except ValueError:
-            print("❌ Digite um número válido.\n")
+        indices = parse_selection(choice, len(groups))
+        if indices is None:
+            print("❌ Seleção inválida. Use um número, lista (1,4,7) ou faixa (2-5).\n")
             continue
 
-        selected = groups[idx]
-        print(f"\n✅ Selecionado: {selected.name}\n")
+        queue = [groups[i] for i in indices]
+        is_queue = len(queue) > 1
+        if is_queue:
+            print(f"\n✅ Fila ({len(queue)} grupos), mesma configuração para todos:")
+            for n, g in enumerate(queue, 1):
+                print(f"   {n}. {g.name}")
+            print()
+        else:
+            print(f"\n✅ Selecionado: {queue[0].name}\n")
 
         print("Que tipo de mídia deseja baixar?\n")
         for key, val in MEDIA_FILTERS.items():
@@ -908,7 +995,7 @@ async def main():
                     if criar != "s":
                         print("⏭  Download cancelado.\n")
                         continue
-                print(f"  📂 Arquivos serão salvos em: {base_dir / sanitize_filename(selected.name)}\n")
+                print(f"  📂 Arquivos serão salvos em: {base_dir}/<nome do grupo>\n")
 
         # Verificar se existe estrutura de curso
         course_structure = None
@@ -928,28 +1015,54 @@ async def main():
             else:
                 print("  ⏭  Downloads serão salvos em pasta única.\n")
 
-        try:
-            await download_media_from_group(
-                client, selected, media_types, limit, base_dir, course_structure,
-                drive_service, drive_root_folder_id,
-            )
-        except (ConnectionError, TimeoutError, OSError) as e:
-            logger.error("Conexão perdida durante download: %s", e)
-            print(f"\n🔌 Conexão perdida: {e}")
-            print("   Tentando reconectar...")
+        post_actions = ask_post_actions()
+        if post_actions is None:
+            print("\nSaindo...")
+            break
+
+        failed_groups: list[str] = []
+        for pos, selected in enumerate(queue, 1):
+            if is_queue:
+                print(f"\n{'#'*50}\n  FILA [{pos}/{len(queue)}]: {selected.name}\n{'#'*50}\n")
             try:
-                await client.connect()
-                print("   ✅ Reconectado! Rode novamente para continuar de onde parou.\n")
-            except Exception as re:
-                logger.error("Falha ao reconectar: %s", re)
-                print(f"   ❌ Falha ao reconectar: {re}")
-                print("   Execute o script novamente para retomar.\n")
-        except errors.FloodWaitError as e:
-            wait_time = e.seconds + 10
-            print(f"\n⏳ Flood wait do Telegram: aguardando {wait_time}s...")
-            logger.warning("FloodWaitError no loop principal: aguardando %ds", wait_time)
-            await asyncio.sleep(wait_time)
-            print("   ✅ Tempo de espera concluído. Rode novamente para continuar.\n")
+                errs = await download_media_from_group(
+                    client, selected, media_types, limit, base_dir, course_structure,
+                    drive_service, drive_root_folder_id, interactive=not is_queue,
+                )
+                if errs:
+                    failed_groups.append(selected.name)
+            except (ConnectionError, TimeoutError, OSError) as e:
+                failed_groups.append(selected.name)
+                logger.error("Conexão perdida durante download: %s", e)
+                print(f"\n🔌 Conexão perdida: {e}")
+                print("   Tentando reconectar...")
+                try:
+                    await client.connect()
+                    print("   ✅ Reconectado! Rode novamente para continuar de onde parou.\n")
+                except Exception as re:
+                    logger.error("Falha ao reconectar: %s", re)
+                    print(f"   ❌ Falha ao reconectar: {re}")
+                    print("   Execute o script novamente para retomar.\n")
+            except errors.FloodWaitError as e:
+                failed_groups.append(selected.name)
+                wait_time = e.seconds + 10
+                print(f"\n⏳ Flood wait do Telegram: aguardando {wait_time}s...")
+                logger.warning("FloodWaitError no loop principal: aguardando %ds", wait_time)
+                await asyncio.sleep(wait_time)
+                print("   ✅ Tempo de espera concluído. Rode novamente para continuar.\n")
+
+        if is_queue:
+            print(f"\n{'='*50}\n  FILA CONCLUÍDA: {len(queue) - len(failed_groups)}/{len(queue)} grupos sem falha")
+            for name in failed_groups:
+                print(f"  ❌ com falha: {name}")
+            print(f"{'='*50}")
+
+        if post_actions != {"1"}:
+            await client.disconnect()
+            summary = f"Download concluído: {len(queue) - len(failed_groups)}/{len(queue)} grupos sem falha"
+            run_post_actions(post_actions, summary)
+            print("\n👋 Até mais!")
+            return
 
         print()
         try:
