@@ -33,7 +33,7 @@ Script Python leve e interativo que usa a API oficial do Telegram (MTProto) para
 - 📊 **Mostra o tamanho total** antes de iniciar o download (quantidade de arquivos + tamanho estimado)
 - 📁 **Organiza por pasta** — cada grupo/canal tem sua própria pasta
 - ⏸️ **Retomada automática** — interrompeu? Execute novamente e ele continua de onde parou
-- 📊 **Barra de progresso** em tempo real com porcentagem e tamanho
+- 📊 **Barra de progresso por download** em tempo real, com porcentagem, tamanho, velocidade (taxa) e ETA de cada arquivo
 - 🗑️ **Limpeza automática** — arquivos incompletos são removidos ao cancelar (Ctrl+C)
 - 💾 **Credenciais salvas localmente** — configure uma vez, use sempre
 - 🚀 **Instalação automática** — o script configura tudo para você
