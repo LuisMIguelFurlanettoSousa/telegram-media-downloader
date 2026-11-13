@@ -8,6 +8,7 @@ import atexit
 import os
 import re
 import sys
+import unicodedata
 import asyncio
 import json
 import logging
@@ -896,6 +897,12 @@ def parse_selection(text: str, total: int) -> list[int] | None:
     return result or None
 
 
+def normalizar_busca(texto: str) -> str:
+    """Minúsculas e sem acento, para busca por trecho do nome."""
+    sem_acento = unicodedata.normalize("NFD", texto)
+    return "".join(c for c in sem_acento if not unicodedata.combining(c)).casefold()
+
+
 POST_ACTIONS = {
     "1": "Nada (só sair)",
     "2": "Desligar a máquina",
@@ -989,24 +996,45 @@ async def main():
             print("❌ Nenhum grupo ou canal encontrado.")
             break
 
-        for i, g in enumerate(groups, 1):
-            member_count = ""
-            entity = g.entity
-            if hasattr(entity, "participants_count") and entity.participants_count:
-                member_count = f" ({entity.participants_count} membros)"
-            tipo = "Canal" if isinstance(entity, Channel) and entity.broadcast else "Grupo"
-            print(f"  {i:3d}. [{tipo}] {g.name}{member_count}")
+        filtro = ""
+        saiu = False
+        while True:
+            termo = normalizar_busca(filtro)
+            exibidos = 0
+            for i, g in enumerate(groups, 1):
+                if termo and termo not in normalizar_busca(g.name or ""):
+                    continue
+                member_count = ""
+                entity = g.entity
+                if hasattr(entity, "participants_count") and entity.participants_count:
+                    member_count = f" ({entity.participants_count} membros)"
+                tipo = "Canal" if isinstance(entity, Channel) and entity.broadcast else "Grupo"
+                print(f"  {i:3d}. [{tipo}] {g.name}{member_count}")
+                exibidos += 1
 
-        print(f"\n  0. Sair\n")
-        print("  Dica: vários de uma vez para fila, ex: 1,4,7 ou 2-5")
+            if filtro:
+                print(f"\n  🔍 Filtro \"{filtro}\": {exibidos} de {len(groups)}")
+                if not exibidos:
+                    print("  Nenhum nome contém esse trecho.")
 
-        try:
-            choice = input("👉 Escolha o(s) número(s) do grupo: ").strip()
-        except (KeyboardInterrupt, EOFError):
-            print("\nSaindo...")
+            print(f"\n  0. Sair\n")
+            print("  Dica: vários de uma vez para fila, ex: 1,4,7 ou 2-5")
+            print("  Buscar por trecho do nome: /trecho   (apenas / limpa o filtro)")
+
+            try:
+                choice = input("👉 Escolha o(s) número(s) do grupo: ").strip()
+            except (KeyboardInterrupt, EOFError):
+                print("\nSaindo...")
+                saiu = True
+                break
+
+            if choice.startswith("/"):
+                filtro = choice[1:].strip()
+                print()
+                continue
             break
 
-        if choice == "0":
+        if saiu or choice == "0":
             break
 
         indices = parse_selection(choice, len(groups))
